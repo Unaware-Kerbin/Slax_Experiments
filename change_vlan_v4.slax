@@ -1,0 +1,84 @@
+version 1.2;
+
+/* Junos Space annotations */
+/* @NAME = "VlanMigration999to1000" */
+/* @DESCRIPTION = "Checks for access mode interfaces on VLAN 999 and replaces with VLAN 1000" */
+/* @ISLOCAL = "false" */
+
+/* Standard namespaces */
+ns junos = "http://xml.juniper.net/junos/*/junos";
+ns xnm = "http://xml.juniper.net/xnm/1.1/xnm";
+ns jcs = "http://xml.juniper.net/junos/commit-scripts/1.0";
+
+import "../import/junos.xsl";
+
+/* Parameters passed by Junos Space for remote execution */
+param $target;
+param $user;
+param $password;
+
+match / {
+    <op-script-results> {
+        /* 1. Establish connection to the target device [4, 5] */
+        var $connection = jcs:open($target, $user, $password);
+
+        if (not($connection)) {
+            <output> "Error: Could not connect to " _ $target;
+        } else {
+            /* 2. Retrieve interface configuration via remote RPC [6, 7] */
+            var $rpc = <get-configuration database="committed"> {
+                <configuration> {
+                    <interfaces>;
+                }
+            }
+            var $config = jcs:execute($connection, $rpc);
+
+            /* 3. Logic to identify matched interfaces (Access Mode + VLAN 999) */
+            var $change-xml = {
+                <configuration> {
+                    <interfaces> {
+                        for-each ($config/interfaces/interface) {
+                            var $int-name = name;
+                            for-each (unit/family/ethernet-switching[interface-mode == "access" and vlan/members == "999"]) {
+                                <interface> {
+                                    <name> $int-name;
+                                    <unit> {
+                                        <name> ../../name;
+                                        <family> {
+                                            <ethernet-switching> {
+                                                <vlan> {
+                                                    <members delete="delete"> "999";
+                                                    <members> "1000";
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            /* 4. Apply and Commit configuration changes remotely [7, 8] */
+            if ($change-xml//interface) {
+                var $load-rpc = <load-configuration action="merge"> {
+                    copy-of $change-xml;
+                }
+                var $load-results = jcs:execute($connection, $load-rpc);
+                var $commit-results = jcs:execute($connection, <commit-configuration>);
+                
+                if ($commit-results//xnm:error) {
+                    copy-of $commit-results//xnm:error;
+                } else {
+                    <output> "VLAN 999 replaced with 1000 on remote host: " _ $target;
+                }
+            } else {
+                <output> "No matching interfaces found on " _ $target;
+            }
+
+            /* 5. Close the remote session [4, 7, 9] */
+            expr jcs:close($connection);
+        }
+    }
+}

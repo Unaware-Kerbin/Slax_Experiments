@@ -1,0 +1,165 @@
+/*
+ * interface-monitor.slax
+ *
+ * Juniper SLAX Event Script
+ * Monitors interface up/down status changes and automatically updates
+ * the interface description to reflect current state with timestamp.
+ *
+ * Installation:
+ *   1. Copy to /var/db/scripts/event/ on the Juniper device
+ *   2. Configure the event policy (see bottom of file for CLI config)
+ *
+ * Tested on: Junos 18.1+
+ */
+
+version 1.1;
+
+ns junos = "http://xml.juniper.net/junos/*/junos";
+ns xnm  = "http://xml.juniper.net/xnm/1.1/xnm";
+ns jcs  = "http://xml.juniper.net/junos/commit-scripts/1.0";
+ns ext  = "http://xmlsoft.org/XSLT/namespace";
+
+import "../import/junos.xsl";
+
+/* -----------------------------------------------------------------------
+ * Main entry point — called by the event daemon
+ * ----------------------------------------------------------------------- */
+match / {
+    <event-script-results> {
+
+        /* ---- Pull event attributes from the triggering syslog event ---- */
+        var $event-name   = event-script-input/trigger-event/id;
+        var $interface    = event-script-input/trigger-event/attribute-list/
+                            attribute[name == "interface-name"]/value;
+        var $timestamp    = event-script-input/trigger-event/timestamp/localtime;
+
+        /* Determine link state based on event type */
+        var $link-state = {
+            if ($event-name == "SNMP_TRAP_LINK_DOWN" or
+                $event-name == "IFNET_LINK_DOWN") {
+                expr "DOWN";
+            } else if ($event-name == "SNMP_TRAP_LINK_UP" or
+                       $event-name == "IFNET_LINK_UP") {
+                expr "UP";
+            } else {
+                expr "UNKNOWN";
+            }
+        }
+
+        /* Build the new description string */
+        var $new-desc = "Link " _ $link-state _ " | Last event: " _ $timestamp;
+
+        /* Log to syslog */
+        expr jcs:syslog("daemon.info",
+            "interface-monitor.slax: " _ $interface _
+            " transitioned to " _ $link-state _
+            " at " _ $timestamp);
+
+        /* Open a persistent connection to Junos API */
+        var $connection = jcs:open();
+
+        if (not($connection)) {
+            expr jcs:syslog("daemon.error",
+                "interface-monitor.slax: Failed to open JCS connection.");
+        } else {
+
+            /* ---- Retrieve current interface description (optional) ---- */
+            var $get-config-rpc = <get-configuration database="committed"> {
+                <configuration> {
+                    <interfaces> {
+                        <interface> {
+                            <name> $interface;
+                        }
+                    }
+                }
+            }
+            var $current-config = jcs:execute($connection, $get-config-rpc);
+            var $current-desc   = $current-config/interfaces/interface/description;
+
+            /* Preserve any existing static description prefix if present.
+             * Convention: "STATIC_PREFIX || Link UP | Last event: ..."
+             * If no separator found, we replace the whole description.      */
+            var $static-prefix = {
+                if (contains($current-desc, " || ")) {
+                    expr substring-before($current-desc, " || ");
+                } else {
+                    expr "";
+                }
+            }
+
+            var $final-desc = {
+                if ($static-prefix != "") {
+                    expr $static-prefix _ " || " _ $new-desc;
+                } else {
+                    expr $new-desc;
+                }
+            }
+
+            /* ---- Build the configuration change ---- */
+            var $change = <configuration> {
+                <interfaces> {
+                    <interface> {
+                        <name> $interface;
+                        <description> $final-desc;
+                    }
+                }
+            }
+
+            /* Load and commit the configuration change */
+            var $load-action = "merge";
+            var $load-results = jcs:load-configuration($connection,
+                                                       $change,
+                                                       $load-action);
+
+            /* Check for errors */
+            if ($load-results//xnm:error) {
+                for-each ($load-results//xnm:error) {
+                    expr jcs:syslog("daemon.error",
+                        "interface-monitor.slax: Config error on " _
+                        $interface _ ": " _ message);
+                }
+            } else {
+                expr jcs:syslog("daemon.notice",
+                    "interface-monitor.slax: Updated description on " _
+                    $interface _ " -> " _ $final-desc);
+            }
+
+            /* Close the connection */
+            expr jcs:close($connection);
+        }
+    }
+}
+
+
+/*
+===========================================================================
+  JUNOS DEVICE CONFIGURATION — paste into CLI
+===========================================================================
+
+  1. Copy the script file:
+     file copy interface-monitor.slax /var/db/scripts/event/
+
+  2. Enable the script and configure the event policy:
+
+set system scripts language slax
+
+set event-options event-script file interface-monitor.slax
+
+set event-options policy INTERFACE_STATUS_CHANGE events SNMP_TRAP_LINK_UP
+set event-options policy INTERFACE_STATUS_CHANGE events SNMP_TRAP_LINK_DOWN
+set event-options policy INTERFACE_STATUS_CHANGE events IFNET_LINK_UP
+set event-options policy INTERFACE_STATUS_CHANGE events IFNET_LINK_DOWN
+set event-options policy INTERFACE_STATUS_CHANGE then event-script interface-monitor.slax
+
+  3. (Optional) Restrict to specific interfaces using an attributes filter:
+set event-options policy INTERFACE_STATUS_CHANGE attributes-match "{$.interface-name}" matches "ge-0/0/*"
+
+  4. Commit:
+     commit check
+     commit
+
+  5. Verify the script is recognized:
+     show system scripts event
+
+===========================================================================
+*/

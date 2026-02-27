@@ -1,0 +1,257 @@
+/*
+ * interface-monitorv3.slax
+ *
+ * Juniper SLAX Event Script - VERSION 3
+ * Monitors interface up/down status changes and automatically updates
+ * the interface description to reflect current state with timestamp.
+ *
+ * CHANGE LOG v3:
+ * - ADDED: The "UP" state description now includes a timestamp, similar
+ * to the "DOWN" state description.
+ * Example: "Default Dot1x - Up as of 2026-02-27 14:00:00"
+ *
+ * CHANGE LOG v2:
+ * - FIXED: Added logic to strip logical unit numbers (e.g. ".0") from
+ * the interface name to prevent phantom interface creation.
+ *
+ * Installation:
+ * 1. Copy to /var/db/scripts/event/ on the Juniper device
+ * 2. Configure the event policy (see bottom of file for CLI config)
+ */
+
+/* -------------------------------------------------------------------------
+ * VERSION DECLARATION
+ * ------------------------------------------------------------------------- */
+version 1.1;
+
+/* -------------------------------------------------------------------------
+ * NAMESPACE DECLARATIONS
+ * ------------------------------------------------------------------------- */
+ns junos = "http://xml.juniper.net/junos/*/junos";
+ns xnm   = "http://xml.juniper.net/xnm/1.1/xnm";
+ns jcs   = "http://xml.juniper.net/junos/commit-scripts/1.0";
+ns ext   = "http://xmlsoft.org/XSLT/namespace";
+
+/* -------------------------------------------------------------------------
+ * IMPORT
+ * ------------------------------------------------------------------------- */
+import "../import/junos.xsl";
+
+/* =========================================================================
+ * MAIN TEMPLATE
+ * ========================================================================= */
+match / {
+    <event-script-results> {
+
+        /* -----------------------------------------------------------------
+         * STEP 1 — EXTRACT EVENT DATA
+         * ----------------------------------------------------------------- */
+        var $event-name      = event-script-input/trigger-event/id;
+        
+        var $raw-interface   = event-script-input/trigger-event/attribute-list/
+                               attribute[name == "interface-name"]/value;
+
+        /* Sanitize the interface name: turn ge-0/0/0.0 into ge-0/0/0 */
+        var $interface = {
+            if (contains($raw-interface, ".")) {
+                expr substring-before($raw-interface, ".");
+            } else {
+                expr $raw-interface;
+            }
+        }
+
+        var $event-timestamp = event-script-input/trigger-event/timestamp/localtime;
+
+
+        /* -----------------------------------------------------------------
+         * STEP 2 — DETERMINE LINK STATE
+         * ----------------------------------------------------------------- */
+        var $link-state = {
+            if ($event-name == "SNMP_TRAP_LINK_DOWN" or
+                $event-name == "IFNET_LINK_DOWN") {
+                expr "DOWN";
+            } else if ($event-name == "SNMP_TRAP_LINK_UP" or
+                       $event-name == "IFNET_LINK_UP") {
+                expr "UP";
+            } else {
+                expr "UNKNOWN";
+            }
+        }
+
+
+        /* -----------------------------------------------------------------
+         * STEP 3 — BUILD THE BASE DESCRIPTION STRINGS
+         *
+         * (Moved $up-desc definition to Step 6A so it can access the 
+         * resolved timestamp)
+         * ----------------------------------------------------------------- */
+         /* placeholder comment */
+
+
+        /* -----------------------------------------------------------------
+         * STEP 4 — LOG THE EVENT TO SYSLOG
+         * ----------------------------------------------------------------- */
+        expr jcs:syslog("daemon.info",
+            "interface-monitor.slax: " _ $interface _
+            " transitioned to " _ $link-state _
+            " at " _ $event-timestamp);
+
+        /* -----------------------------------------------------------------
+         * STEP 5 — OPEN A JCS (NETCONF) CONNECTION TO THE LOCAL DEVICE
+         * ----------------------------------------------------------------- */
+        var $connection = jcs:open();
+
+        if (not($connection)) {
+            expr jcs:syslog("daemon.error",
+                "interface-monitor.slax: Failed to open JCS connection.");
+        } else {
+
+            /* -------------------------------------------------------------
+             * STEP 6 — FETCH THE CURRENT COMMITTED INTERFACE CONFIGURATION
+             * ------------------------------------------------------------- */
+            
+            /* -------------------------------------------------------------
+             * STEP 6A -- RESOLVE THE TIMESTAMP
+             * Priority: Event Time -> System Time -> "unknown time"
+             * ------------------------------------------------------------- */
+            var $uptime-rpc  = <get-system-uptime-information>;
+            var $uptime-reply = jcs:execute($connection, $uptime-rpc);
+            var $system-time  = $uptime-reply/current-time/date-time;
+
+            var $timestamp = {
+                if ($event-timestamp != "") {
+                    expr $event-timestamp;
+                } else if ($system-time != "") {
+                    expr $system-time;
+                } else {
+                    expr "unknown time";
+                }
+            }
+
+            /* Final description strings now that $timestamp is resolved */
+            var $down-desc = "Interface down as of " _ $timestamp;
+            
+            /* NEW: Up description now includes the timestamp */
+            var $up-desc   = "Default Dot1x - Up as of " _ $timestamp;
+
+
+            var $get-config-rpc = <get-configuration database="committed"> {
+                <configuration> {
+                    <interfaces> {
+                        <interface> {
+                            <name> $interface;
+                        }
+                    }
+                }
+            }
+            var $current-config = jcs:execute($connection, $get-config-rpc);
+            var $current-desc   = $current-config/interfaces/interface/description;
+
+
+            /* -------------------------------------------------------------
+             * STEP 7 — SELECT THE FINAL DESCRIPTION BASED ON LINK STATE
+             * ------------------------------------------------------------- */
+            var $final-desc = {
+                if ($link-state == "DOWN") {
+                    expr $down-desc;
+                } else if ($link-state == "UP") {
+                    expr $up-desc;
+                } else {
+                    expr "Link state unknown as of " _ $timestamp;
+                }
+            }
+
+
+            /* -------------------------------------------------------------
+             * STEP 8 — BUILD THE CONFIGURATION CHANGE XML BLOCK
+             * ------------------------------------------------------------- */
+            var $change = <configuration> {
+                <interfaces> {
+                    <interface> {
+                        <name> $interface;
+                        <description> $final-desc;
+                    }
+                }
+            }
+
+
+            /* -------------------------------------------------------------
+             * STEP 9 — LOAD THE CONFIGURATION CHANGE
+             * ------------------------------------------------------------- */
+            var $load-rpc = <load-configuration action="merge"> {
+                copy-of $change;
+            }
+            var $load-results = jcs:execute($connection, $load-rpc);
+
+            /* Check whether the load step returned any errors */
+            if ($load-results//xnm:error) {
+                for-each ($load-results//xnm:error) {
+                    expr jcs:syslog("daemon.error",
+                        "interface-monitor.slax: Config load error on " _
+                        $interface _ ": " _ message);
+                }
+            } else {
+
+                /* ---------------------------------------------------------
+                 * STEP 10 — COMMIT THE CANDIDATE CONFIGURATION
+                 * --------------------------------------------------------- */
+                var $commit-rpc = <commit-configuration> {
+                    <log> "interface-monitor.slax: auto-updated description on " _ $interface;
+                }
+                var $commit-results = jcs:execute($connection, $commit-rpc);
+
+                /* Check whether the commit itself failed */
+                if ($commit-results//xnm:error) {
+                    for-each ($commit-results//xnm:error) {
+                        expr jcs:syslog("daemon.error",
+                            "interface-monitor.slax: Commit error on " _
+                            $interface _ ": " _ message);
+                    }
+                } else {
+                    /* Success — log the final description that was applied */
+                    expr jcs:syslog("daemon.notice",
+                        "interface-monitor.slax: Updated and committed description on " _
+                        $interface _ " -> " _ $final-desc);
+                }
+            }
+
+
+            /* -------------------------------------------------------------
+             * STEP 11 — CLOSE THE JCS CONNECTION
+             * ------------------------------------------------------------- */
+            expr jcs:close($connection);
+        }
+    }
+}
+
+
+/*
+===========================================================================
+  JUNOS DEVICE CONFIGURATION — paste into CLI
+===========================================================================
+
+  1. Copy the script file to the device:
+     file copy interface-monitorv3.slax /var/db/scripts/event/
+
+  2. Enable SLAX and register the script + event policy:
+
+set system scripts language slax
+set event-options event-script file interface-monitorv3.slax
+
+set event-options policy INTERFACE_STATUS_CHANGE events SNMP_TRAP_LINK_UP
+set event-options policy INTERFACE_STATUS_CHANGE events SNMP_TRAP_LINK_DOWN
+set event-options policy INTERFACE_STATUS_CHANGE events IFNET_LINK_UP
+set event-options policy INTERFACE_STATUS_CHANGE events IFNET_LINK_DOWN
+set event-options policy INTERFACE_STATUS_CHANGE then event-script interface-monitorv3.slax
+
+  3. (Optional) Restrict to specific interfaces using an attributes filter:
+set event-options policy INTERFACE_STATUS_CHANGE attributes-match "{$.interface-name}" matches "ge-0/0/*"
+
+  4. Commit and verify:
+     commit check
+     commit
+     show system scripts event
+     show log messages | match interface-monitor
+
+===========================================================================
+*/

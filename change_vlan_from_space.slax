@@ -1,0 +1,136 @@
+version 1.2;
+
+/* 
+ * Junos Space Annotations
+ * These define the metadata parsed and stored in the Junos Space database [6, 7].
+ */
+/* @NAME = "VlanMigration_Local_V19" */
+/* @DESCRIPTION = "VLAN migration executed locally on the Junos Space server" */
+
+/* 
+ * ISLOCAL = "true" runs the script on the Junos Space server [1, 3].
+ * PASSDEVICECREDENTIALS = "true" provides the target device credentials [8].
+ */
+/* @ISLOCAL = "true" */
+/* @PASSDEVICECREDENTIALS = "true" */
+
+/* Variable Context defines the input fields in the Junos Space UI [9, 10] */
+/* @VARIABLECONTEXT = "[{'name':'old_vlan','defaultvalue':'vlan999','parameterscope':'global'},{'name':'new_vlan','defaultvalue':'vlan1000','parameterscope':'global'}]" */
+
+/* Standard Namespaces [11, 12] */
+ns junos = "http://xml.juniper.net/junos/*/junos";
+ns xnm = "http://xml.juniper.net/xnm/1.1/xnm";
+ns jcs = "http://xml.juniper.net/junos/commit-scripts/1.0";
+
+/* Import junos.xsl to access predefined global parameters [13-15] */
+import "../import/junos.xsl";
+
+/* 
+ * Declaring Op Script Command-Line Arguments 
+ * This enables context-sensitive help in the CLI [16-19].
+ */
+var $arguments = {
+    <argument> {
+        <name> "old_vlan";
+        <description> "The existing VLAN name (e.g., vlan999)";
+    }
+    <argument> {
+        <name> "new_vlan";
+        <description> "The new VLAN name to be applied";
+    }
+}
+
+/* 
+ * Global Parameters 
+ * Parameter names MUST be identical to the names in the $arguments 
+ * variable and the @VARIABLECONTEXT annotation [20-22].
+ */
+param $target;   /* IP/Hostname passed by Junos Space [3] */
+param $user;     /* Username passed by Junos Space [8] */
+param $password; /* Password passed by Junos Space [8] */
+param $old_vlan;
+param $new_vlan;
+
+/* 
+ * Establish a management session to the remote device [4, 5].
+ * This is required when running locally on Junos Space (@ISLOCAL="true").
+ */
+var $conn = jcs:open($target, $user, $password);
+
+match / {
+    <op-script-results> {
+        /* Check if the management session was successfully established [23] */
+        if (not($conn)) {
+            expr jcs:output("ERROR: Connection failed to " _ $target);
+            expr jcs:output("Ensure the SSH host key is accepted on the Junos Space server.");
+        } else {
+            /* Retrieve device hostname for verification [24] */
+            var $sw-info = jcs:execute($conn, <get-software-information>);
+            var $device-name = $sw-info/host-name;
+
+            expr jcs:output("Executing on: " _ $device-name _ " (" _ $target _ ")");
+            expr jcs:output("Migrating " _ $old_vlan _ " to " _ $new_vlan);
+
+            /* 1. Fetch interface configuration using the connection handle [25, 26] */
+            var $get-config = <get-configuration database="committed"> {
+                <configuration> {
+                    <interfaces>;
+                }
+            }
+            var $config = jcs:execute($conn, $get-config);
+
+            /* 2. Build change XML using the validated hierarchy from your source */
+            var $change-xml = {
+                <configuration> {
+                    <interfaces> {
+                        for-each ($config/interfaces/interface) {
+                            var $int-name = name;
+                            /* Matches your specific XML path: unit/family/ethernet-switching/vlan/members */
+                            for-each (unit/family/ethernet-switching/vlan[members == $old_vlan]) {
+                                <interface> {
+                                    <name> $int-name;
+                                    <unit> {
+                                        <name> ../../name; /* Use ../../ to reach back to unit/name [27, 28] */
+                                        <family> {
+                                            <ethernet-switching> {
+                                                <vlan> {
+                                                    /* Replace matching member [user xml source] */
+                                                    <members delete="delete"> $old_vlan;
+                                                    <members> $new_vlan;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            /* 3. Apply and Commit changes via the remote connection [25, 26] */
+            if ($change-xml//interface) {
+                expr jcs:output("Matching interfaces found. Staging migration...");
+                var $load-res = jcs:execute($conn, <load-configuration action="merge"> {
+                    copy-of $change-xml;
+                });
+                
+                if ($load-res//xnm:error) {
+                    /* Output the error from the Junos management process if the load fails [29] */
+                    copy-of $load-res//xnm:error;
+                } else {
+                    expr jcs:output("Committing changes...");
+                    var $commit-res = jcs:execute($conn, <commit-configuration>);
+                    expr jcs:output("SUCCESS: Migration completed on " _ $device-name);
+                }
+            } else {
+                expr jcs:output("No interfaces found matching VLAN " _ $old_vlan);
+            }
+
+            /* 4. Explicitly close the remote management session [4, 26] */
+            expr jcs:close($conn);
+        }
+    }
+}
+
+
