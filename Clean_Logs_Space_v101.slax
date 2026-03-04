@@ -1,0 +1,299 @@
+version 1.2;
+
+ns junos   = "http://xml.juniper.net/junos/*/junos";
+ns xnm     = "http://xml.juniper.net/xnm/1.1/xnm";
+ns jcs     = "http://xml.juniper.net/junos/commit-scripts/1.0";
+ns common  = "http://exslt.org/common";
+
+import "../import/junos.xsl";
+
+/* @NAME        = "Clean_Logs_Space_v101"                                      */
+/* @DESCRIPTION = "v101: Production build. Human-readable output with clear   */
+/*                 section headers, per-member summaries, and a final space   */
+/*                 recovered summary. Dynamically discovers /var subdirs at   */
+/*                 runtime. Two-pass cleanup. fpc prefix for VC file RPCs.    */
+
+/* @ISLOCAL = "true" */
+
+match / {
+    <op-script-results> {
+
+        <o> "============================================================";
+        <o> "  Junos Space Storage Cleanup";
+        <o> "============================================================";
+
+        var $conn = jcs:open();
+
+        if (not($conn)) {
+            <o> "  ERROR: Could not open NETCONF session.";
+            <o> "         Check NETCONF is enabled and Space has connectivity.";
+        } else {
+
+            var $vc-res = jcs:execute($conn, <get-virtual-chassis-information>);
+
+            if ($vc-res//xnm:error) {
+                <o> concat("  ERROR: Cannot retrieve VC info: ",
+                                $vc-res//xnm:error/message);
+            } else {
+
+                var $members = $vc-res//member-list/member;
+                var $is-vc   = boolean(count($members) > 0);
+
+                if ($is-vc) {
+                    <o> concat("  Virtual Chassis  : ", count($members),
+                                    " member(s) detected");
+                } else {
+                    <o> "  Chassis          : Standalone (no VC)";
+                }
+
+                /* --------------------------------------------------------- */
+                /* PRE-CLEANUP STORAGE                                        */
+                /* --------------------------------------------------------- */
+                var $st-before = jcs:execute($conn, <get-system-storage>);
+                <o> " ";
+                <o> "  Storage Before Cleanup:";
+                for-each ($st-before//filesystem) {
+                    <o> concat("    ", normalize-space(mounted-on),
+                                    "  -  ", normalize-space(used-percent),
+                                    "% used  (",
+                                    normalize-space(available-blocks),
+                                    " KB free)");
+                }
+
+                /* --------------------------------------------------------- */
+                /* DISCOVER SCANNABLE /var SUBDIRS                           */
+                /* --------------------------------------------------------- */
+                var $blocklist-rtf = {
+                    <b> "chroot";
+                    <b> "cron";
+                    <b> "db";
+                    <b> "empty";
+                    <b> "home";
+                    <b> "jail";
+                    <b> "jails";
+                    <b> "logical-systems";
+                    <b> "opt";
+                    <b> "pdb";
+                    <b> "platform-config";
+                    <b> "preserve";
+                    <b> "rundb";
+                    <b> "tenant";
+                }
+                var $blocklist = common:node-set($blocklist-rtf);
+
+                var $var-scan = jcs:execute($conn,
+                    <file-list> { <path> "/var"; <detail>; });
+
+                if ($var-scan//xnm:error) {
+                    <o> concat("  ERROR: Cannot scan /var: ",
+                                    $var-scan//xnm:error/message);
+                } else {
+
+                    var $scan-dirs-rtf = {
+                        for-each ($var-scan//file-information) {
+                            if (file-directory) {
+                                var $dname = normalize-space(file-name);
+                                if (not($blocklist/b[. = $dname])) {
+                                    <path> concat("/var/", $dname);
+                                }
+                            }
+                        }
+                    }
+                    var $scan-dirs = common:node-set($scan-dirs-rtf);
+
+                    <o> " ";
+                    <o> concat("  Directories to scan  : ",
+                                    count($scan-dirs/path));
+                    <o> concat("  Directories skipped  : ",
+                                    count($blocklist/b),
+                                    " (system-protected)");
+                    for-each ($scan-dirs/path) {
+                        <o> concat("    + ", string(.));
+                    }
+
+                    /* ===================================================== */
+                    /* PASS 1 - SURGICAL SCAN AND DELETE                     */
+                    /* ===================================================== */
+                    <o> " ";
+                    <o> "------------------------------------------------------------";
+                    <o> "  Pass 1 of 2 : Scanning for junk files";
+                    <o> "------------------------------------------------------------";
+
+                    var $member-list-rtf = {
+                        if (not($is-vc)) {
+                            <m> "0";
+                        } else {
+                            for-each ($members) {
+                                <m> normalize-space(member-id);
+                            }
+                        }
+                    }
+                    var $member-list = common:node-set($member-list-rtf);
+
+                    for-each ($member-list/m) {
+                        var $mid = string(.);
+
+                        if ($is-vc) {
+                            <o> " ";
+                            <o> concat("  [ FPC ", $mid, " ]");
+                        }
+
+                        for-each ($scan-dirs/path) {
+                            var $root-path = string(.);
+
+                            var $scan-path = {
+                                if ($is-vc) {
+                                    expr concat("fpc", $mid, ":", $root-path);
+                                } else {
+                                    expr $root-path;
+                                }
+                            }
+
+                            var $scan-res = jcs:execute($conn,
+                                <file-list> {
+                                    <path>   $scan-path;
+                                    <detail>;
+                                });
+
+                            if ($scan-res//xnm:error) {
+                                <o> concat("  WARNING : Could not scan ",
+                                                $scan-path, " - ",
+                                                $scan-res//xnm:error/message);
+                            } else {
+
+                                for-each ($scan-res//file-information) {
+                                    var $fname  = normalize-space(file-name);
+                                    var $is-dir = boolean(file-directory);
+
+                                    if (not($is-dir)) {
+
+                                        var $suffix = substring-after($fname, ".");
+                                        var $is-numbered = boolean(
+                                            contains($fname, ".")
+                                            and string-length($suffix) > 0
+                                            and not(contains($suffix, "."))
+                                            and translate($suffix,
+                                                          "0123456789", "") = ""
+                                        );
+
+                                        var $is-target = boolean(
+                                            contains($fname, ".tgz")   or
+                                            contains($fname, ".gz")    or
+                                            contains($fname, ".core")  or
+                                            contains($fname, ".log")   or
+                                            contains($fname, ".old")   or
+                                            $is-numbered               or
+                                            (contains($root-path, "crash")
+                                             and not(contains($fname, ".")))
+                                        );
+
+                                        var $is-protected = boolean(
+                                            (starts-with($fname, "junos-")
+                                             and not(contains($root-path, "tmp")))
+                                            or starts-with($fname, "kernel")
+                                            or $fname == "wtmp"
+                                            or $fname == "wtmp.0.gz"
+                                        );
+
+                                        if ($is-target and not($is-protected)) {
+                                            var $del-path = {
+                                                if ($is-vc) {
+                                                    expr concat("fpc", $mid, ":",
+                                                                $root-path, "/",
+                                                                $fname);
+                                                } else {
+                                                    expr concat($root-path, "/",
+                                                                $fname);
+                                                }
+                                            }
+
+                                            var $del-res = jcs:execute($conn,
+                                                <file-delete> {
+                                                    <path> $del-path;
+                                                });
+
+                                            if ($del-res//xnm:error) {
+                                                <o> concat("  SKIPPED  : ",
+                                                                $root-path, "/",
+                                                                $fname, " (",
+                                                                $del-res//xnm:error/message,
+                                                                ")");
+                                            } else {
+                                                <o> concat("  Deleted  : ",
+                                                                $root-path, "/",
+                                                                $fname);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    /* ===================================================== */
+                    /* PASS 2 - NATIVE CLEANUP                               */
+                    /* ===================================================== */
+                    <o> " ";
+                    <o> "------------------------------------------------------------";
+                    <o> "  Pass 2 of 2 : Native Junos storage cleanup";
+                    <o> "------------------------------------------------------------";
+
+                    if (not($is-vc)) {
+                        var $p2-res = jcs:execute($conn,
+                                          <request-system-storage-cleanup>);
+                        if ($p2-res//xnm:error) {
+                            <o> concat("  ERROR : ", $p2-res//xnm:error/message);
+                        } else {
+                            <o> "  Done";
+                        }
+                    } else {
+                        for-each ($members) {
+                            var $mid = normalize-space(member-id);
+                            var $p2-vc = jcs:execute($conn,
+                                <request-system-storage-cleanup> {
+                                    <member> $mid;
+                                });
+                            if ($p2-vc//xnm:error) {
+                                <o> concat("  FPC ", $mid, " ERROR : ",
+                                                $p2-vc//xnm:error/message);
+                            } else {
+                                <o> concat("  FPC ", $mid, " : Done");
+                            }
+                        }
+                    }
+
+                }   /* end /var scan else block */
+
+                /* --------------------------------------------------------- */
+                /* POST-CLEANUP STORAGE + SUMMARY                            */
+                /* --------------------------------------------------------- */
+                var $st-after = jcs:execute($conn, <get-system-storage>);
+                <o> " ";
+                <o> "============================================================";
+                <o> "  Cleanup Complete - Storage Summary";
+                <o> "============================================================";
+                <o> "  Before:";
+                for-each ($st-before//filesystem) {
+                    <o> concat("    ", normalize-space(mounted-on),
+                                    "  -  ", normalize-space(used-percent),
+                                    "% used  (",
+                                    normalize-space(available-blocks),
+                                    " KB free)");
+                }
+                <o> "  After:";
+                for-each ($st-after//filesystem) {
+                    <o> concat("    ", normalize-space(mounted-on),
+                                    "  -  ", normalize-space(used-percent),
+                                    "% used  (",
+                                    normalize-space(available-blocks),
+                                    " KB free)");
+                }
+
+            }   /* end VC info else block */
+
+            expr jcs:close($conn);
+            <o> "============================================================";
+
+        }   /* end jcs:open() else block */
+    }
+}
