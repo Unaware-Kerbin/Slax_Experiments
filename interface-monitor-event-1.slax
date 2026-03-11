@@ -1,0 +1,189 @@
+/*
+ * interface-monitor-event.slax
+ *
+ * Juniper SLAX Event Script - VERSION 4
+ * Polls ALL interfaces at a configurable timer interval and automatically
+ * updates each interface description to reflect current operational state
+ * with a timestamp.
+ *
+ * HOW IT WORKS:
+ * - Triggered by the synthetic timer event UPDATE_INTERFACE_DESCRIPTIONS
+ *   (defined via generate-event in event-options). The interval is set in
+ *   the device config -- this script does not care what the value is.
+ * - Fetches live operational data for all physical interfaces.
+ * - For each interface, loads and commits a description update:
+ *     UP   -> "Default Dot1x - Up as of <timestamp>"
+ *     DOWN -> "Interface down as of <timestamp>"
+ *
+ * CHANGE LOG v4:
+ * - REWRITE: Script no longer relies on per-event interface-name attributes.
+ *   Instead it polls all interfaces via get-interface-information on every
+ *   timer firing, making it compatible with the generate-event / time-interval
+ *   event-options configuration.
+ *
+ * Installation:
+ * 1. Copy to /var/db/scripts/event/ on the Juniper device
+ * 2. Ensure event-options is configured as follows:
+ *
+ *    event-options {
+ *        generate-event {
+ *            UPDATE_INTERFACE_DESCRIPTIONS time-interval <seconds>;
+ *        }
+ *        policy INTERFACE_STATUS_CHANGE {
+ *            events UPDATE_INTERFACE_DESCRIPTIONS;
+ *            then {
+ *                event-script interface-monitor-event.slax;
+ *            }
+ *        }
+ *        event-script {
+ *            file interface-monitor-event.slax;
+ *        }
+ *    }
+ */
+
+/* -------------------------------------------------------------------------
+ * VERSION DECLARATION
+ * ------------------------------------------------------------------------- */
+version 1.1;
+
+/* -------------------------------------------------------------------------
+ * NAMESPACE DECLARATIONS
+ * ------------------------------------------------------------------------- */
+ns junos = "http://xml.juniper.net/junos/*/junos";
+ns xnm   = "http://xml.juniper.net/xnm/1.1/xnm";
+ns jcs   = "http://xml.juniper.net/junos/commit-scripts/1.0";
+/* -------------------------------------------------------------------------
+ * IMPORT
+ * ------------------------------------------------------------------------- */
+import "../import/junos.xsl";
+
+/* =========================================================================
+ * MAIN TEMPLATE
+ * ========================================================================= */
+match / {
+    <event-script-results> {
+
+        /* -----------------------------------------------------------------
+         * STEP 1 - OPEN A JCS (NETCONF) CONNECTION TO THE LOCAL DEVICE
+         * ----------------------------------------------------------------- */
+        var $connection = jcs:open();
+
+        if (not($connection)) {
+            expr jcs:syslog("daemon.error",
+                "interface-monitor-event.slax: Failed to open JCS connection.");
+        } else {
+
+            /* -------------------------------------------------------------
+             * STEP 2 - RESOLVE A TIMESTAMP FROM THE SYSTEM CLOCK
+             * ------------------------------------------------------------- */
+            var $uptime-rpc   = <get-system-uptime-information>;
+            var $uptime-reply = jcs:execute($connection, $uptime-rpc);
+            var $system-time  = $uptime-reply//date-time;
+
+            var $timestamp = {
+                if ($system-time != "") {
+                    expr $system-time;
+                } else {
+                    expr "unknown time";
+                }
+            }
+
+            /* -------------------------------------------------------------
+             * STEP 3 - FETCH CURRENT OPERATIONAL STATE FOR ALL INTERFACES
+             * ------------------------------------------------------------- */
+            var $get-ifd-rpc  = <get-interface-information> {
+                <terse>;
+            }
+            var $ifd-reply = jcs:execute($connection, $get-ifd-rpc);
+
+            /* -------------------------------------------------------------
+             * STEP 4 - LOOP OVER EVERY PHYSICAL INTERFACE
+             *
+             * We select only <physical-interface> elements so we never
+             * create phantom logical sub-interfaces.
+             * ------------------------------------------------------------- */
+            for-each ($ifd-reply//physical-interface[
+                starts-with(name, "ge-") or
+                starts-with(name, "xe-") or
+                starts-with(name, "et-")]) {
+
+                var $interface  = name;
+                var $oper-state = oper-status;   /* "up" or "down" */
+
+                /* Build the new description based on operational state */
+                var $new-desc = {
+                    if ($oper-state == "up") {
+                        expr "Default Dot1x - Up as of " _ $timestamp;
+                    } else if ($oper-state == "down") {
+                        expr "Interface down as of " _ $timestamp;
+                    } else {
+                        expr "Link state " _ $oper-state _ " as of " _ $timestamp;
+                    }
+                }
+
+                expr jcs:syslog("daemon.info",
+                    "interface-monitor-event.slax: " _ $interface _
+                    " is " _ $oper-state _ " -> setting desc: " _ $new-desc);
+
+                /* -----------------------------------------------------------
+                 * STEP 5 - LOAD THE DESCRIPTION CHANGE FOR THIS INTERFACE
+                 * ----------------------------------------------------------- */
+                var $change = <configuration> {
+                    <interfaces> {
+                        <interface> {
+                            <name> $interface;
+                            <description> $new-desc;
+                        }
+                    }
+                }
+
+                var $load-rpc = <load-configuration action="merge"> {
+                    copy-of $change;
+                }
+                var $load-results = jcs:execute($connection, $load-rpc);
+
+                if ($load-results//xnm:error) {
+                    for-each ($load-results//xnm:error) {
+                        expr jcs:syslog("daemon.error",
+                            "interface-monitor-event.slax: Load error on " _
+                            $interface _ ": " _ message);
+                    }
+                    /* NOTE: No discard here. Discarding would wipe all
+                     * successfully loaded interfaces accumulated so far
+                     * this cycle. We log and continue; the final commit
+                     * applies whatever loaded cleanly, and the discard
+                     * after a commit failure handles any remaining mess. */
+                }
+            }
+
+            /* -------------------------------------------------------------
+             * STEP 6 - COMMIT ALL DESCRIPTION CHANGES IN A SINGLE PASS
+             *
+             * We load all interfaces first, then commit once so we only
+             * need a single commit for the entire polling cycle.
+             * ------------------------------------------------------------- */
+            var $commit-rpc = <commit-configuration> {
+                <log> "interface-monitor-event.slax: bulk description update";
+            }
+            var $commit-results = jcs:execute($connection, $commit-rpc);
+
+            if ($commit-results//xnm:error) {
+                for-each ($commit-results//xnm:error) {
+                    expr jcs:syslog("daemon.error",
+                        "interface-monitor-event.slax: Commit error: " _ message);
+                }
+                /* Discard uncommitted changes so the candidate is left clean */
+                var $discard-on-fail-rpc = <discard-changes>;
+                expr jcs:execute($connection, $discard-on-fail-rpc);
+            } else {
+                expr jcs:syslog("daemon.notice",
+                    "interface-monitor-event.slax: Bulk description commit succeeded.");
+            }
+
+            /* -------------------------------------------------------------
+             * STEP 7 - CLOSE THE JCS CONNECTION
+             * ------------------------------------------------------------- */
+            expr jcs:close($connection);
+        }
+    }
+}
