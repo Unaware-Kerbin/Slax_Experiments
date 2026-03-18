@@ -7,8 +7,8 @@ ns common  = "http://exslt.org/common";
 
 import "../import/junos.xsl";
 
-/* @NAME        = "Clean_Logs_Space_v101"                                      */
-/* @DESCRIPTION = "v101: Production build. Human-readable output with clear   */
+/* @NAME        = "Clean_Logs_Space_v103"                                      */
+/* @DESCRIPTION = "v103: Production build. Human-readable output with clear   */
 /*                 section headers, per-member summaries, and a final space   */
 /*                 recovered summary. Dynamically discovers /var subdirs at   */
 /*                 runtime. Two-pass cleanup. fpc prefix for VC file RPCs.    */
@@ -28,6 +28,29 @@ match / {
             <o> "  ERROR: Could not open NETCONF session.";
             <o> "         Check NETCONF is enabled and Space has connectivity.";
         } else {
+
+            /* --------------------------------------------------------- */
+            /* MODEL FAILSAFE - EX2300 and EX3400 only                   */
+            /* --------------------------------------------------------- */
+            var $sw-info = jcs:execute($conn, <get-software-information>);
+            var $model = normalize-space($sw-info//product-model);
+            var $model-upper = translate($model,
+                                   "abcdefghijklmnopqrstuvwxyz",
+                                   "ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+            var $model-ok = boolean(
+                contains($model-upper, "EX2300") or
+                contains($model-upper, "EX3400")
+            );
+
+            if (not($model-ok)) {
+                <o> concat("  ERROR: Unsupported platform - ", $model);
+                <o> "         This script may only run on EX2300 or EX3400 switches.";
+                <o> "         Aborting.";
+                <o> "============================================================";
+                expr jcs:close($conn);
+            } else {
+
+            <o> concat("  Platform         : ", $model, " (supported)");
 
             var $vc-res = jcs:execute($conn, <get-virtual-chassis-information>);
 
@@ -182,6 +205,8 @@ match / {
                                             contains($fname, ".core")  or
                                             contains($fname, ".log")   or
                                             contains($fname, ".old")   or
+                                            contains($fname, ".qcow2") or
+                                            contains($fname, ".txt")   or
                                             $is-numbered               or
                                             (contains($root-path, "crash")
                                              and not(contains($fname, ".")))
@@ -189,7 +214,8 @@ match / {
 
                                         var $is-protected = boolean(
                                             (starts-with($fname, "junos-")
-                                             and not(contains($root-path, "tmp")))
+                                             and not(contains($root-path, "tmp"))
+                                             and not(contains($fname, ".qcow2")))
                                             or starts-with($fname, "kernel")
                                             or $fname == "wtmp"
                                             or $fname == "wtmp.0.gz"
@@ -293,6 +319,8 @@ match / {
 
             expr jcs:close($conn);
             <o> "============================================================";
+
+            }   /* end model-ok else block */
 
         }   /* end jcs:open() else block */
     }
